@@ -56,9 +56,7 @@ const std = @import("std");
 const util = @import("util");
 const ast_utils = @import("../ast_utils.zig");
 const _rule = @import("../rule.zig");
-const _span = @import("../../span.zig");
 
-const Span = _span.Span;
 const LinterContext = @import("../lint_context.zig");
 const Rule = _rule.Rule;
 const NodeWrapper = _rule.NodeWrapper;

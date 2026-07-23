@@ -33,7 +33,8 @@ pub fn lint(alloc: Allocator, io: Io, environ: std.process.Environ, options: Opt
     // NOTE: everything config related is stored in the same arena. This
     // includes the config source string, the parsed Config object, and
     // (eventually) whatever each rule needs to store. This lets all configs
-    // store slices to the config's source, avoiding allocations.
+    // store slices to the config's source, avoiding allocations. Include
+    // patterns built from positional arguments live here too.
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
 
@@ -74,10 +75,30 @@ pub fn lint(alloc: Allocator, io: Io, environ: std.process.Environ, options: Opt
         defer service.deinit();
 
         if (!options.stdin) {
+            var invalid_arg: []const u8 = "";
+            const include = normalizeIncludes(arena.allocator(), io, options.args.items, &invalid_arg) catch |e| {
+                var reported: [1]Error = .{
+                    switch (e) {
+                        error.PathNotFound => Error.fmt(
+                            alloc,
+                            "no such file or directory: '{s}'",
+                            .{invalid_arg},
+                        ),
+                        error.PathOutsideCwd => Error.fmt(
+                            alloc,
+                            "'{s}' is outside of the current working directory",
+                            .{invalid_arg},
+                        ),
+                        else => return e,
+                    } catch return error.OutOfMemory,
+                };
+                try reporter.reportErrorSlice(alloc, &reported);
+                return 1;
+            };
             var visitor: LintVisitor = .{
                 .service = &service,
                 .allocator = alloc,
-                .include = options.args.items,
+                .include = include,
                 .exclude = config.config.ignore,
             };
             var src = try Io.Dir.cwd().openDir(io, ".", .{ .iterate = true });
@@ -181,6 +202,102 @@ const LintVisitor = struct {
     }
 };
 
+/// Errors produced when a positional argument is a path that cannot be
+/// linted. The offending argument is stored in `invalid_arg`.
+pub const NormalizeIncludesError = error{
+    /// The path does not exist.
+    PathNotFound,
+    /// The path is outside of the current working directory. The walker only
+    /// covers the cwd, so it could never match anything.
+    PathOutsideCwd,
+};
+
+/// Turn positional CLI arguments into glob patterns used to filter walked
+/// files.
+///
+/// Arguments containing glob syntax pass through unchanged. Everything else
+/// is treated as a filesystem path: directories become `<dir>/**` (so
+/// `zlint src` lints everything under `src/`) and files are matched exactly.
+/// Paths that do not exist or that leave the cwd are errors, since silently
+/// linting 0 files hides mistakes, especially in CI.
+///
+/// Patterns are allocated in `alloc`, which must outlive the walk (an arena
+/// is used in practice).
+fn normalizeIncludes(
+    alloc: Allocator,
+    io: Io,
+    args: []const []const u8,
+    invalid_arg: ?*[]const u8,
+) (NormalizeIncludesError || Io.Dir.StatFileError || Io.Dir.RealPathFileError || Allocator.Error)![]const glob.Pattern {
+    if (args.len == 0) return &.{};
+
+    const sep_str = if (comptime util.IS_WINDOWS) "\\" else "/";
+    var includes: std.ArrayListUnmanaged(glob.Pattern) = try .initCapacity(alloc, args.len);
+
+    const cwd = Io.Dir.cwd();
+    // Canonical absolute path of the cwd, resolved lazily on the first
+    // path-like argument.
+    var cwd_abs: ?[]const u8 = null;
+
+    for (args) |raw| {
+        if (isGlobPattern(raw)) {
+            includes.appendAssumeCapacity(raw);
+            continue;
+        }
+
+        if (cwd_abs == null) cwd_abs = try cwd.realPathFileAlloc(io, ".", alloc);
+        // Lexically resolve `./`, trailing separators, and `..` against the
+        // cwd, then express the result relative to it. The walker only covers
+        // the cwd and produces cwd-relative paths, so this handles `./src`,
+        // absolute paths, and catches paths outside the cwd.
+        const abs = try path.resolve(alloc, &.{ cwd_abs.?, raw });
+        const rel = try path.relative(alloc, cwd_abs.?, null, cwd_abs.?, abs);
+        // On Windows `rel` stays absolute when on a different drive.
+        if (path.isAbsolute(rel) or mem.eql(u8, rel, "..") or
+            mem.startsWith(u8, rel, ".." ++ sep_str))
+        {
+            if (invalid_arg) |ptr| ptr.* = raw;
+            return error.PathOutsideCwd;
+        }
+        // `zlint .` lints the whole cwd, just like bare `zlint`.
+        if (rel.len == 0) {
+            includes.appendAssumeCapacity("**");
+            continue;
+        }
+
+        const stat = cwd.statFile(io, rel, .{}) catch |e| switch (e) {
+            error.FileNotFound, error.NotDir => {
+                if (invalid_arg) |ptr| ptr.* = raw;
+                return error.PathNotFound;
+            },
+            else => return e,
+        };
+
+        // Glob patterns use '/' separators, even on Windows.
+        const normalized = if (comptime util.IS_WINDOWS) blk: {
+            const owned = try alloc.dupe(u8, rel);
+            mem.replaceScalar(u8, owned, std.fs.path.sep, '/');
+            break :blk owned;
+        } else rel;
+
+        includes.appendAssumeCapacity(switch (stat.kind) {
+            .directory => try std.fmt.allocPrint(alloc, "{s}/**", .{normalized}),
+            else => normalized,
+        });
+    }
+
+    return includes.items;
+}
+
+/// Does an argument contain glob syntax? Arguments with glob characters are
+/// matched as patterns; anything else is treated as a filesystem path.
+fn isGlobPattern(arg: []const u8) bool {
+    if (arg.len == 0) return false;
+    if (arg[0] == '!') return true; // negated pattern
+    const glob_chars = if (comptime util.IS_WINDOWS) "*?[]{}" else "*?[]{}\\";
+    return mem.indexOfAny(u8, arg, glob_chars) != null;
+}
+
 /// Modified version of `streamUntilDelimiterOrEof` from zig v0.14.1's stdlib.
 ///
 /// Reads from the stream until specified byte is found. If the buffer is not
@@ -205,4 +322,81 @@ pub fn readUntilDelimiterOrEof(self: *std.Io.Reader, buffer: []u8, delimiter: u8
     if (bytes_read == 0) return null;
     self.toss(1); // throw out the delimiter
     return buffer[0..bytes_read];
+}
+
+const t = std.testing;
+
+// These tests assume the cwd is the repository root, like the lint_config
+// tests.
+test normalizeIncludes {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const cwd = Io.Dir.cwd();
+    const cwd_abs = try cwd.realPathFileAlloc(t.io, ".", alloc);
+    const src_abs = try path.join(alloc, &.{ cwd_abs, "src" });
+    const build_abs = try path.join(alloc, &.{ cwd_abs, "build.zig" });
+
+    const Case = struct {
+        args: []const []const u8,
+        expected: []const []const u8,
+    };
+    const cases = [_]Case{
+        .{ .args = &.{}, .expected = &.{} },
+        // directories lint everything under them
+        .{ .args = &.{"src"}, .expected = &.{"src/**"} },
+        .{ .args = &.{"src/"}, .expected = &.{"src/**"} },
+        .{ .args = &.{"./src"}, .expected = &.{"src/**"} },
+        .{ .args = &.{ ".", "./" }, .expected = &.{ "**", "**" } },
+        // files match exactly
+        .{ .args = &.{"build.zig"}, .expected = &.{"build.zig"} },
+        .{ .args = &.{"./build.zig"}, .expected = &.{"build.zig"} },
+        // glob patterns pass through untouched
+        .{ .args = &.{"src/**"}, .expected = &.{"src/**"} },
+        .{ .args = &.{"!src/**"}, .expected = &.{"!src/**"} },
+        .{ .args = &.{"**/*.zig"}, .expected = &.{"**/*.zig"} },
+        // absolute paths within the cwd are relativized
+        .{ .args = &.{src_abs}, .expected = &.{"src/**"} },
+        .{ .args = &.{build_abs}, .expected = &.{"build.zig"} },
+        // mixed arguments
+        .{
+            .args = &.{ "src", "build.zig", "test/**" },
+            .expected = &.{ "src/**", "build.zig", "test/**" },
+        },
+    };
+
+    for (cases) |case| {
+        const actual = try normalizeIncludes(alloc, t.io, case.args, null);
+        try t.expectEqual(case.expected.len, actual.len);
+        for (case.expected, actual) |expected_pattern, actual_pattern| {
+            try t.expectEqualStrings(expected_pattern, actual_pattern);
+        }
+    }
+}
+
+test "normalizeIncludes rejects paths that do not exist" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var invalid_arg: []const u8 = "";
+    try t.expectError(
+        error.PathNotFound,
+        normalizeIncludes(alloc, t.io, &.{"definitely-not-a-real-zlint-path"}, &invalid_arg),
+    );
+    try t.expectEqualStrings("definitely-not-a-real-zlint-path", invalid_arg);
+}
+
+test "normalizeIncludes rejects paths outside of the cwd" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var invalid_arg: []const u8 = "";
+    try t.expectError(
+        error.PathOutsideCwd,
+        normalizeIncludes(alloc, t.io, &.{ "..", "../outside" }, &invalid_arg),
+    );
+    try t.expectEqualStrings("..", invalid_arg);
 }
